@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 
-const db = require('./db');   // this is the pg Pool now
+const db = require('./db'); // pg Pool
 
 const app = express();
 app.use(cors());
@@ -10,14 +10,19 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+
+// Root Check
 app.get('/', (req, res) => {
   res.send('Cosmos Atlas API Running');
 });
 
-// GET ALL EVENTS
+
+// ALL EVENTS — ORDERED BY TIME
 app.get('/events', async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM timeline_event');
+    const result = await db.query(
+      'SELECT * FROM timeline_event ORDER BY time_start_years ASC'
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -25,7 +30,8 @@ app.get('/events', async (req, res) => {
   }
 });
 
-// TOP LEVEL EVENTS
+
+// TOP-LEVEL EVENTS ONLY (NO PARENT)
 app.get('/events/top', async (req, res) => {
   try {
     const result = await db.query(
@@ -34,9 +40,10 @@ app.get('/events/top', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json(err);
+    res.status(500).json({ error: 'Database Error' });
   }
 });
+
 
 // CHILD EVENTS
 app.get('/events/children/:id', async (req, res) => {
@@ -50,10 +57,12 @@ app.get('/events/children/:id', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json(err);
+    res.status(500).json({ error: 'Database Error' });
   }
 });
 
+
+// START SERVER
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
