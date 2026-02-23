@@ -62,6 +62,28 @@ app.get('/events/children/:id', async (req, res) => {
 });
 
 
+// 🔗 RELATED EVENTS (from event_relation table)
+app.get('/events/:eventId/related', async (req, res) => {
+  const { eventId } = req.params;
+  try {
+    // Get related events from both directions (event_id → related_event_id and vice versa)
+    const result = await db.query(
+      `SELECT DISTINCT e.*
+       FROM timeline_event e
+       JOIN event_relation r ON (e.event_id = r.related_event_id AND r.event_id = $1)
+                             OR (e.event_id = r.event_id AND r.related_event_id = $1)
+       WHERE e.event_id != $1
+       ORDER BY e.time_start_years ASC`,
+      [eventId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching related events:', err);
+    res.status(500).json({ error: 'Database Error' });
+  }
+});
+
+
 // START SERVER
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
