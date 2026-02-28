@@ -18,11 +18,11 @@ const PORT = process.env.PORT || 3000;
 // ========== PASSWORD STRENGTH RULES ==========
 const passwordSchema = new passwordValidator();
 passwordSchema
-    .is().min(8)                                    // minimum length 8
-    .has().uppercase()                              // must have uppercase letters
-    .has().lowercase()                              // must have lowercase letters
-    .has().digits()                                 // must have digits
-    .has().symbols();                                // must have special characters
+    .is().min(8)
+    .has().uppercase()
+    .has().lowercase()
+    .has().digits()
+    .has().symbols();
 
 // ========== SUPABASE CLIENT ==========
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -33,16 +33,25 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ========== EMAIL TRANSPORTER ==========
+// ========== EMAIL TRANSPORTER (Improved) ==========
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // use TLS
+  requireTLS: true,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
-  }
+  },
+  tls: {
+    rejectUnauthorized: false // may help with some network issues
+  },
+  connectionTimeout: 10000, // 10 seconds
+  greetingTimeout: 10000,
+  socketTimeout: 15000
 });
 
-// ========== MULTER (memory storage for avatar) ==========
+// ========== MULTER ==========
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
@@ -71,7 +80,7 @@ app.get('/', (req, res) => {
   res.send('Cosmos Atlas API Running');
 });
 
-// ---------- EVENT ROUTES (using db pool) ----------
+// ---------- EVENT ROUTES ----------
 app.get('/events', async (req, res) => {
   try {
     const result = await db.query(
@@ -195,12 +204,14 @@ app.post('/auth/admin/login', async (req, res) => {
 });
 
 // ========== SIGN-UP FLOW ==========
-// 1. Request OTP (fixed delete+insert)
+// 1. Request OTP (async email)
 app.post('/auth/request-otp', async (req, res) => {
   const { email } = req.body;
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
   }
+
+  console.log(`[OTP] Request for ${email}`);
 
   try {
     // Check if email already registered
@@ -231,17 +242,22 @@ app.post('/auth/request-otp', async (req, res) => {
 
     if (insertError) {
       console.error('Error inserting OTP:', insertError);
-      return res.status(500).json({ error: 'Failed to store OTP. Please check server logs.' });
+      return res.status(500).json({ error: 'Failed to store OTP' });
     }
 
-    // Send email
-    await transporter.sendMail({
+    // Send email asynchronously – don't await
+    transporter.sendMail({
       from: process.env.EMAIL_USER,
       to: email,
       subject: 'Your OTP for CosmosAtlas Registration',
       text: `Your OTP is: ${otp}. It will expire in ${OTP_EXPIRY_MINUTES} minutes.`
+    }).then(info => {
+      console.log(`[OTP] Email sent to ${email}: ${info.messageId}`);
+    }).catch(err => {
+      console.error(`[OTP] Email error for ${email}:`, err);
     });
 
+    // Respond immediately
     res.status(200).json({ message: 'OTP sent successfully' });
   } catch (err) {
     console.error('OTP request error:', err);
@@ -249,7 +265,7 @@ app.post('/auth/request-otp', async (req, res) => {
   }
 });
 
-// 2. Verify OTP and Register (with password validation)
+// 2. Verify OTP and Register
 app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
   const { email, otp, username, password } = req.body;
   const avatarFile = req.file;
@@ -288,7 +304,7 @@ app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
       return res.status(400).json({ error: 'Username already taken' });
     }
 
-    // ---- PASSWORD STRENGTH VALIDATION ----
+    // Password strength validation
     if (!passwordSchema.validate(password)) {
       return res.status(400).json({
         error: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.'
@@ -304,7 +320,7 @@ app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
     if (avatarFile) {
       const fileName = `avatar_${Date.now()}_${avatarFile.originalname}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
-        .from('avatars') // Ensure this bucket exists
+        .from('avatars')
         .upload(fileName, avatarFile.buffer, {
           contentType: avatarFile.mimetype,
           cacheControl: '3600',
@@ -316,7 +332,6 @@ app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
         return res.status(500).json({ error: 'Failed to upload avatar' });
       }
 
-      // Get public URL
       const { data: urlData } = supabase.storage
         .from('avatars')
         .getPublicUrl(fileName);
@@ -324,7 +339,7 @@ app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
       avatarUrl = urlData.publicUrl;
     }
 
-    // Insert user into Supabase users table
+    // Insert user
     const { data: newUser, error: insertError } = await supabase
       .from('users')
       .insert({
@@ -347,7 +362,7 @@ app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
       .delete()
       .eq('email', email);
 
-    // Generate JWT and log user in immediately
+    // Generate JWT
     const token = jwt.sign(
       { userId: newUser.user_id, email: newUser.email, role: 'user' },
       JWT_SECRET,
