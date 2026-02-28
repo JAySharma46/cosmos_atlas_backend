@@ -8,7 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 const passwordValidator = require('password-validator');
 const db = require('./db'); // PostgreSQL pool for events (existing)
-const dns = require('dns');  // added for IPv4 forcing
+const dns = require('dns'); // for IPv4 forcing
 
 const app = express();
 app.use(cors());
@@ -34,12 +34,12 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ========== EMAIL TRANSPORTER (with IPv4 fix) ==========
+// ========== EMAIL TRANSPORTER (IPv4 forced on port 465) ==========
+console.log('Initializing email transporter with IPv4...');
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  requireTLS: true,
+  port: 465,
+  secure: true, // use SSL
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
@@ -48,12 +48,22 @@ const transporter = nodemailer.createTransport({
     rejectUnauthorized: false,
     ciphers: 'SSLv3'
   },
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
   socketTimeout: 20000,
-  // Force IPv4 to avoid ENETUNREACH on Render
+  // Force IPv4
   lookup: (hostname, options, cb) => {
-    dns.lookup(hostname, { family: 4 }, cb);
+    options.family = 4;
+    dns.lookup(hostname, options, cb);
+  }
+});
+
+// Verify transporter configuration (optional)
+transporter.verify((error, success) => {
+  if (error) {
+    console.error('SMTP connection error:', error);
+  } else {
+    console.log('SMTP server is ready to take messages');
   }
 });
 
