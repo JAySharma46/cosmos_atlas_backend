@@ -8,6 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 const passwordValidator = require('password-validator');
 const db = require('./db'); // PostgreSQL pool for events (existing)
+const dns = require('dns');  // added for IPv4 forcing
 
 const app = express();
 app.use(cors());
@@ -33,22 +34,27 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// ========== EMAIL TRANSPORTER (Improved) ==========
+// ========== EMAIL TRANSPORTER (with IPv4 fix) ==========
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
   port: 587,
-  secure: false, // use TLS
+  secure: false,
   requireTLS: true,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
   },
   tls: {
-    rejectUnauthorized: false // may help with some network issues
+    rejectUnauthorized: false,
+    ciphers: 'SSLv3'
   },
-  connectionTimeout: 10000, // 10 seconds
-  greetingTimeout: 10000,
-  socketTimeout: 15000
+  connectionTimeout: 15000,
+  greetingTimeout: 15000,
+  socketTimeout: 20000,
+  // Force IPv4 to avoid ENETUNREACH on Render
+  lookup: (hostname, options, cb) => {
+    dns.lookup(hostname, { family: 4 }, cb);
+  }
 });
 
 // ========== MULTER ==========
