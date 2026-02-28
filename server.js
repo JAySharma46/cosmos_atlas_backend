@@ -195,7 +195,7 @@ app.post('/auth/admin/login', async (req, res) => {
 });
 
 // ========== SIGN-UP FLOW ==========
-// 1. Request OTP
+// 1. Request OTP (fixed delete+insert)
 app.post('/auth/request-otp', async (req, res) => {
   const { email } = req.body;
   if (!email) {
@@ -214,21 +214,24 @@ app.post('/auth/request-otp', async (req, res) => {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
-    // Generate OTP
+    // Generate OTP and expiry
     const otp = generateOtp();
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
-    // Store OTP (upsert)
+    // Delete any existing OTP for this email
+    await supabase
+      .from('email_verifications')
+      .delete()
+      .eq('email', email);
+
+    // Insert new OTP
     const { error: insertError } = await supabase
       .from('email_verifications')
-      .upsert(
-        { email, otp, expires_at: expiresAt },
-        { onConflict: 'email' }
-      );
+      .insert({ email, otp, expires_at: expiresAt });
 
     if (insertError) {
-      console.error('Error storing OTP:', insertError);
-      return res.status(500).json({ error: 'Failed to store OTP' });
+      console.error('Error inserting OTP:', insertError);
+      return res.status(500).json({ error: 'Failed to store OTP. Please check server logs.' });
     }
 
     // Send email
