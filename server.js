@@ -1,9 +1,13 @@
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config();
+const multer = require('multer');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
-
-const db = require('./db'); // pg Pool (still used for events)
+require('dotenv').config();
+const passwordValidator = require('password-validator');
+const db = require('./db'); // PostgreSQL pool for events (existing)
 
 const app = express();
 app.use(cors());
@@ -11,7 +15,16 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ========== SUPABASE CLIENT (for auth) ==========
+// ========== PASSWORD STRENGTH RULES ==========
+const passwordSchema = new passwordValidator();
+passwordSchema
+    .is().min(8)                                    // minimum length 8
+    .has().uppercase()                              // must have uppercase letters
+    .has().lowercase()                              // must have lowercase letters
+    .has().digits()                                 // must have digits
+    .has().symbols();                                // must have special characters
+
+// ========== SUPABASE CLIENT ==========
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 if (!supabaseUrl || !supabaseKey) {
@@ -20,7 +33,40 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Root Check
+// ========== EMAIL TRANSPORTER ==========
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// ========== MULTER (memory storage for avatar) ==========
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif/;
+    const extname = allowedTypes.test(file.originalname.toLowerCase().split('.').pop());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only images are allowed'));
+    }
+  }
+});
+
+// ========== CONSTANTS ==========
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const OTP_EXPIRY_MINUTES = parseInt(process.env.OTP_EXPIRY_MINUTES) || 10;
+
+// ========== UTILITY FUNCTIONS ==========
+const generateOtp = () => Math.floor(100000 + Math.random() * 900000).toString();
+
+// ========== ROOT ==========
 app.get('/', (req, res) => {
   res.send('Cosmos Atlas API Running');
 });
@@ -84,11 +130,6 @@ app.get('/events/:eventId/related', async (req, res) => {
 });
 
 // ========== AUTHENTICATION ==========
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-
 // USER LOGIN
 app.post('/auth/user/login', async (req, res) => {
   const { email, password } = req.body;
@@ -141,11 +182,7 @@ app.post('/auth/admin/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { 
-        adminId: admin.admin_id, 
-        email: admin.email, 
-        role: 'admin' 
-      },
+      { adminId: admin.admin_id, email: admin.email, role: 'admin' },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -157,7 +194,176 @@ app.post('/auth/admin/login', async (req, res) => {
   }
 });
 
-// START SERVER
+// ========== SIGN-UP FLOW ==========
+// 1. Request OTP
+app.post('/auth/request-otp', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  try {
+    // Check if email already registered
+    const { data: existingUser, error: userError } = await supabase
+      .from('users')
+      .select('email')
+      .eq('email', email)
+      .single();
+
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+
+    // Generate OTP
+    const otp = generateOtp();
+    const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString();
+
+    // Store OTP (upsert)
+    const { error: insertError } = await supabase
+      .from('email_verifications')
+      .upsert(
+        { email, otp, expires_at: expiresAt },
+        { onConflict: 'email' }
+      );
+
+    if (insertError) {
+      console.error('Error storing OTP:', insertError);
+      return res.status(500).json({ error: 'Failed to store OTP' });
+    }
+
+    // Send email
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'Your OTP for CosmosAtlas Registration',
+      text: `Your OTP is: ${otp}. It will expire in ${OTP_EXPIRY_MINUTES} minutes.`
+    });
+
+    res.status(200).json({ message: 'OTP sent successfully' });
+  } catch (err) {
+    console.error('OTP request error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 2. Verify OTP and Register (with password validation)
+app.post('/auth/verify-otp', upload.single('avatar'), async (req, res) => {
+  const { email, otp, username, password } = req.body;
+  const avatarFile = req.file;
+
+  if (!email || !otp || !username || !password) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    // Verify OTP
+    const { data: otpRecord, error: otpError } = await supabase
+      .from('email_verifications')
+      .select('*')
+      .eq('email', email)
+      .eq('otp', otp)
+      .single();
+
+    if (otpError || !otpRecord) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(otpRecord.expires_at);
+    if (now > expiresAt) {
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+
+    // Check if username already taken
+    const { data: existingUsername, error: usernameCheckError } = await supabase
+      .from('users')
+      .select('username')
+      .eq('username', username)
+      .single();
+
+    if (existingUsername) {
+      return res.status(400).json({ error: 'Username already taken' });
+    }
+
+    // ---- PASSWORD STRENGTH VALIDATION ----
+    if (!passwordSchema.validate(password)) {
+      return res.status(400).json({
+        error: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.'
+      });
+    }
+
+    // Hash password
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+
+    // Upload avatar if provided
+    let avatarUrl = null;
+    if (avatarFile) {
+      const fileName = `avatar_${Date.now()}_${avatarFile.originalname}`;
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('avatars') // Ensure this bucket exists
+        .upload(fileName, avatarFile.buffer, {
+          contentType: avatarFile.mimetype,
+          cacheControl: '3600',
+          upsert: false
+        });
+
+      if (uploadError) {
+        console.error('Avatar upload error:', uploadError);
+        return res.status(500).json({ error: 'Failed to upload avatar' });
+      }
+
+      // Get public URL
+      const { data: urlData } = supabase.storage
+        .from('avatars')
+        .getPublicUrl(fileName);
+
+      avatarUrl = urlData.publicUrl;
+    }
+
+    // Insert user into Supabase users table
+    const { data: newUser, error: insertError } = await supabase
+      .from('users')
+      .insert({
+        email,
+        username,
+        password: passwordHash,
+        avatar_url: avatarUrl
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('User insert error:', insertError);
+      return res.status(500).json({ error: 'Failed to create user' });
+    }
+
+    // Delete used OTP
+    await supabase
+      .from('email_verifications')
+      .delete()
+      .eq('email', email);
+
+    // Generate JWT and log user in immediately
+    const token = jwt.sign(
+      { userId: newUser.user_id, email: newUser.email, role: 'user' },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      role: 'user',
+      user: { id: newUser.user_id, email: newUser.email, username: newUser.username, avatarUrl: newUser.avatar_url }
+    });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
