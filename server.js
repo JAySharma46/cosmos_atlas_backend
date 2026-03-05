@@ -38,11 +38,8 @@ const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif/;
-    const extname = allowedTypes.test(file.originalname.toLowerCase().split('.').pop());
-    const mimetype = allowedTypes.test(file.mimetype);
-    if (mimetype && extname) {
-      return cb(null, true);
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
     } else {
       cb(new Error('Only images are allowed'));
     }
@@ -181,106 +178,112 @@ app.post('/auth/admin/login', async (req, res) => {
 });
 
 // ========== DIRECT REGISTRATION (NO OTP) ==========
-app.post('/auth/register', upload.single('avatar'), async (req, res) => {
-  const { email, username, password } = req.body;
-  const avatarFile = req.file;
-
-  if (!email || !username || !password) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
-  try {
-    // Check if email already exists
-    const { data: existingEmail, error: emailError } = await supabase
-      .from('users')
-      .select('email')
-      .eq('email', email)
-      .single();
-
-    if (existingEmail) {
-      return res.status(400).json({ error: 'Email already registered' });
+app.post('/auth/register', (req, res) => {
+  upload.single('avatar')(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message });
     }
 
-    // Check if username already exists
-    const { data: existingUsername, error: usernameError } = await supabase
-      .from('users')
-      .select('username')
-      .eq('username', username)
-      .single();
+    const { email, username, password } = req.body;
+    const avatarFile = req.file;
 
-    if (existingUsername) {
-      return res.status(400).json({ error: 'Username already taken' });
+    if (!email || !username || !password) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Validate password strength
-    if (!passwordSchema.validate(password)) {
-      return res.status(400).json({
-        error: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.'
-      });
-    }
+    try {
+      // Check if email already exists
+      const { data: existingEmail } = await supabase
+        .from('users')
+        .select('email')
+        .eq('email', email)
+        .single();
 
-    // Hash password
-    const saltRounds = 10;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
-
-    // Upload avatar if provided
-    let avatarUrl = null;
-    if (avatarFile) {
-      const fileName = `avatar_${Date.now()}_${avatarFile.originalname}`;
-      const { data: uploadData, error: uploadError } = await supabase.storage
-        .from('avatars')
-        .upload(fileName, avatarFile.buffer, {
-          contentType: avatarFile.mimetype,
-          cacheControl: '3600',
-          upsert: false
-        });
-
-      if (uploadError) {
-        console.error('Avatar upload error:', uploadError);
-        return res.status(500).json({ error: 'Failed to upload avatar' });
+      if (existingEmail) {
+        return res.status(400).json({ error: 'Email already registered' });
       }
 
-      const { data: urlData } = supabase.storage
-        .from('avatars')
-        .getPublicUrl(fileName);
+      // Check if username already exists
+      const { data: existingUsername } = await supabase
+        .from('users')
+        .select('username')
+        .eq('username', username)
+        .single();
 
-      avatarUrl = urlData.publicUrl;
+      if (existingUsername) {
+        return res.status(400).json({ error: 'Username already taken' });
+      }
+
+      // Validate password strength
+      if (!passwordSchema.validate(password)) {
+        return res.status(400).json({
+          error: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character.'
+        });
+      }
+
+      // Hash password
+      const saltRounds = 10;
+      const passwordHash = await bcrypt.hash(password, saltRounds);
+
+      // Upload avatar if provided
+      let avatarUrl = null;
+      if (avatarFile) {
+        const fileName = `avatar_${Date.now()}_${avatarFile.originalname}`;
+        const { error: uploadError } = await supabase.storage
+          .from('avatars')
+          .upload(fileName, avatarFile.buffer, {
+            contentType: avatarFile.mimetype,
+            cacheControl: '3600',
+            upsert: false
+          });
+
+        if (uploadError) {
+          console.error('Avatar upload error:', uploadError);
+          return res.status(500).json({ error: 'Failed to upload avatar' });
+        }
+
+        const { data: urlData } = supabase.storage
+          .from('avatars')
+          .getPublicUrl(fileName);
+
+        avatarUrl = urlData.publicUrl;
+      }
+
+      // Insert user
+      const { data: newUser, error: insertError } = await supabase
+        .from('users')
+        .insert({
+          email,
+          username,
+          password: passwordHash,
+          avatar_url: avatarUrl
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('User insert error:', insertError);
+        return res.status(500).json({ error: 'Failed to create user' });
+      }
+
+      // Generate JWT
+      const token = jwt.sign(
+        { userId: newUser.user_id, email: newUser.email, role: 'user' },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      res.status(201).json({
+        message: 'User registered successfully',
+        token,
+        role: 'user',
+        user: { id: newUser.user_id, email: newUser.email, username: newUser.username, avatarUrl: newUser.avatar_url }
+      });
+    } catch (err) {
+      console.error('Registration error:', err);
+      res.status(500).json({ error: 'Internal server error' });
     }
-
-    // Insert user
-    const { data: newUser, error: insertError } = await supabase
-      .from('users')
-      .insert({
-        email,
-        username,
-        password: passwordHash,
-        avatar_url: avatarUrl
-      })
-      .select()
-      .single();
-
-    if (insertError) {
-      console.error('User insert error:', insertError);
-      return res.status(500).json({ error: 'Failed to create user' });
-    }
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: newUser.user_id, email: newUser.email, role: 'user' },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(201).json({
-      message: 'User registered successfully',
-      token,
-      role: 'user',
-      user: { id: newUser.user_id, email: newUser.email, username: newUser.username, avatarUrl: newUser.avatar_url }
-    });
-  } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  });
 });
 
 // ========== START SERVER ==========
